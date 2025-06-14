@@ -475,20 +475,76 @@ class ArcFace(tf.keras.layers.Layer):
 
     def compute_output_shape(self, input_shape):
         return (None, self.n_classes)
+#### Mamba defination
+class MambaBlock(tf.keras.layers.Layer):
+    def __init__(self, hidden_dim=128):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.norm = None
+        self.linear_B = None
+        self.linear_C = None
+        self.out_proj = None
+        self.A = None
+
+    def build(self, input_shape):
+        if input_shape[-1] is None:
+            raise ValueError("Channel dimension must be defined for MambaBlock.")
+        self.norm = tf.keras.layers.LayerNormalization(axis=-1, epsilon=1e-5)
+        self.linear_B = tf.keras.layers.Dense(self.hidden_dim)
+        self.linear_C = tf.keras.layers.Dense(self.hidden_dim)
+        self.out_proj = tf.keras.layers.Dense(self.hidden_dim)
+
+        self.A = self.add_weight(
+            name="A",
+            shape=(self.hidden_dim,),
+            initializer="zeros",
+            trainable=True
+        )
+
+
+
 
 ##### Gmamba Defination
 class GMamba(tf.keras.layers.Layer):
-    def __init__(self):
+    def __init__(self, hidden_dim=128):
         super().__init__()
-        self.norm = tf.keras.layers.LayerNormalization()
-        self.mamba = MambaBlock()  # define this as per Mamba spec
+        self.norm = tf.keras.layers.LayerNormalization(axis=-1, epsilon=1e-5)
+        self.mamba = MambaBlock(hidden_dim)
 
     def call(self, x):
-        d_seq = x[:, 1:] - x[:, :-1]
-        d_seq = tf.pad(d_seq, [[0, 0], [1, 0], [0, 0], [0, 0], [0, 0]])  # pad for alignment
+        d_seq = x[:, 1:, :, :, :] - x[:, :-1, :, :, :]
+        zero_pad = tf.zeros_like(x[:, :1, :, :, :])
+        d_seq = tf.concat([zero_pad, d_seq], axis=1)
+
         d_seq_norm = self.norm(d_seq)
+
+        # Ensure build is called manually (required in Functional API if shape is dynamic)
+        if not self.mamba.built:
+            self.mamba.build(d_seq_norm.shape)
+
         out = self.mamba(d_seq_norm)
         return d_seq + out
+
+
+
+### Lmamba defination
+class LMamba(tf.keras.layers.Layer):
+    def __init__(self, hidden_dim=128):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.mamba = MambaBlock(hidden_dim)
+        self.norm = tf.keras.layers.LayerNormalization(axis=-1, epsilon=1e-5)
+
+    def call(self, x):
+        # Ensure mamba is built
+        if not self.mamba.built:
+            self.mamba.build(x.shape)
+
+        s = self.mamba(x)
+        s_norm = self.norm(s)
+        return x + s_norm
+
+
 
 ####### Model Training
 
@@ -527,37 +583,10 @@ conv21_rai = two_plus_oneDConv(64, 3, 32, 32, 32, 40)
 conv22_rai = two_plus_oneDConv(64, 3, 32, 32, 64 + 32, 40)
 conv23_rai = two_plus_oneDConv(64, 3, 32, 32, 160, 40)
 
-##### Channel Attention Module
-# jlce_module = JLCE(1,5,64)
-# cam3d = CAM3D(128,40,32,32,1)
-# eca_module = ECA_Module(40,32,32,128,1,1)
-# optisecam3d_shuffle = OptiSECAM3D_Shuffle(128,1)
-cross_mseca_module = Cross_MSECA_Module(40, 32, 32, 128, 3)
+##### Initialize GMamba and LMamba
+gmamba_layer = GMamba()
+lmamba_layer = LMamba(hidden_dim=128)
 
-##### TEA
-#### TEA-1
-conv1_TEA1 = tf.keras.layers.Conv2D(filters=128, kernel_size=(1, 1), padding='same',
-                                    activation='relu', kernel_regularizer=tf.keras.regularizers.l2(1e-5))
-# TEA_ME_1 = TEA_ME(4, 128)
-TEA_MTA_1 = TEA_MTA(2, 40, 32, 32, 128)
-conv2_TEA1 = tf.keras.layers.Conv2D(filters=128, kernel_size=(1, 1), padding='same',
-                                    activation='relu', kernel_regularizer=tf.keras.regularizers.l2(1e-5))
-
-#### TEA-2
-conv1_TEA2 = tf.keras.layers.Conv2D(filters=128, kernel_size=(1, 1), padding='same',
-                                    activation='relu', kernel_regularizer=tf.keras.regularizers.l2(1e-5))
-# TEA_ME_2 = TEA_ME(8, 256)
-TEA_MTA_2 = TEA_MTA(2, 40, 32, 32, 128)
-conv2_TEA2 = tf.keras.layers.Conv2D(filters=128, kernel_size=(1, 1), padding='same',
-                                    activation='relu', kernel_regularizer=tf.keras.regularizers.l2(1e-5))
-
-#### TEA-3
-conv1_TEA3 = tf.keras.layers.Conv2D(filters=128, kernel_size=(1, 1), padding='same',
-                                    activation='relu', kernel_regularizer=tf.keras.regularizers.l2(1e-5))
-# TEA_ME_3 = TEA_ME(16, 512)
-TEA_MTA_3 = TEA_MTA(2, 40, 32, 32, 128)
-conv2_TEA3 = tf.keras.layers.Conv2D(filters=128, kernel_size=(1, 1), padding='same',
-                                    activation='relu', kernel_regularizer=tf.keras.regularizers.l2(1e-5))
 
 ##### ArcFace Loss
 arc_logit_layer = ArcFace(11, 30.0, 0.3, tf.keras.regularizers.l2(1e-4))
@@ -615,4 +644,46 @@ conv22_rai = tf.keras.layers.Concatenate(axis=-1)([conv22_rai,conv21_rai])
 conv23_rai = conv23_rai(conv22_rai)
 
 #### Concatenation Operation
-conv23 = tf.keras.layers.Concatenate(axis=-1)([conv23_rdi,conv23_rai])
+X_concat= tf.keras.layers.Concatenate(axis=-1)([conv23_rdi,conv23_rai])
+
+# Pass through variation-aware Mamba modules
+X_global = gmamba_layer(X_concat)   # GMamba (variation-based)
+X_local  = lmamba_layer(X_concat)   # LMamba (local residual refinement)
+
+X_gmamba_lmamba_add = tf.keras.layers.Add()([X_global, X_local])
+print(X_gmamba_lmamba_add.shape)
+
+gap_op = tf.keras.layers.GlobalAveragePooling3D()(X_gmamba_lmamba_add)
+dense1 = tf.keras.layers.Dense(256, activation='relu')(gap_op)
+dropout1 = tf.keras.layers.Dropout(rate=0.2)(dense1)
+
+### ArcFace Output Layer
+dense2 = tf.keras.layers.Dense(256, kernel_initializer='he_normal',
+                               kernel_regularizer=tf.keras.regularizers.l2(1e-4))(dropout1)
+##dense2 = tf.keras.layers.BatchNormalization()(dense2)
+dense3 = arc_logit_layer(([dense2, Input_Labels]))
+
+###### Compiling Model
+model = tf.keras.models.Model(inputs=[Input_Layer_rdi, Input_Layer_rai,Input_Labels], outputs=dense3)
+model.compile(tf.keras.optimizers.Adam(learning_rate=1e-4), loss='categorical_crossentropy', metrics=['accuracy'])
+
+model.summary()
+
+###### Training the Model
+history = model.fit(
+    [X_train_rdi, X_train_rai,y_train_onehot], y_train_onehot,
+    epochs=30,
+    batch_size=2,
+    validation_data=([X_dev_rdi, X_dev_rai,y_dev_onehot], y_dev_onehot),
+    validation_batch_size=2)
+
+##### Saving Training Metrics
+np.save('exp_1_gamba_lmamba_history.npy', history.history)
+
+# Save only the architecture
+model_json = model.to_json()
+with open("exp_1_gamba_lmamba_architecture.json", "w") as json_file:
+    json_file.write(model_json)
+
+# Save only the weights
+model.save_weights("exp_1_gamba_lmamba.weights.h5")
